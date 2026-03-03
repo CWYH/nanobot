@@ -149,6 +149,17 @@ class ChannelManager:
             except ImportError as e:
                 logger.warning("Matrix channel not available: {}", e)
 
+        # Microsoft Teams channel
+        if self.config.channels.teams.enabled:
+            try:
+                from nanobot.channels.teams import TeamsChannel
+                self.channels["teams"] = TeamsChannel(
+                    self.config.channels.teams, self.bus
+                )
+                logger.info("Teams channel enabled")
+            except ImportError as e:
+                logger.warning("Teams channel not available: {}", e)
+
         self._validate_allow_from()
 
     def _validate_allow_from(self) -> None:
