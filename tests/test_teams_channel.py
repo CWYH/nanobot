@@ -15,6 +15,7 @@ from nanobot.bus.queue import MessageBus
 from nanobot.channels.teams.auth import (
     AuthToken,
     PasswordGrantProvider,
+    StaticTokenProvider,
     TeamsAuthError,
     TeamsAuthManager,
 )
@@ -231,6 +232,50 @@ class TestPasswordGrantProvider:
         assert calls[0].get("grant_type") == "password"
 
 
+# ── Auth: StaticTokenProvider ──
+
+
+class TestStaticTokenProvider:
+    """Tests for static token provider."""
+
+    @pytest.mark.asyncio
+    async def test_acquire_token_returns_provided_token(self) -> None:
+        provider = StaticTokenProvider(access_token="my-static-token")
+        token = await provider.acquire_token()
+        assert token.access_token == "my-static-token"
+        assert token.refresh_token is None
+
+    @pytest.mark.asyncio
+    async def test_force_refresh_returns_same_token(self) -> None:
+        provider = StaticTokenProvider(access_token="my-static-token")
+        token = await provider.acquire_token(force_refresh=True)
+        assert token.access_token == "my-static-token"
+
+    @pytest.mark.asyncio
+    async def test_force_refresh_does_not_crash(self) -> None:
+        provider = StaticTokenProvider(access_token="tok")
+        # Should not raise
+        await provider.acquire_token(force_refresh=True)
+
+    @pytest.mark.asyncio
+    async def test_far_future_expiry(self) -> None:
+        provider = StaticTokenProvider(access_token="tok")
+        token = await provider.acquire_token()
+        # Should expire far in the future (at least 9 years from now)
+        assert token.expires_at > time.time() + 9 * 365 * 24 * 3600
+
+    def test_empty_token_raises(self) -> None:
+        with pytest.raises(TeamsAuthError, match="non-empty"):
+            StaticTokenProvider(access_token="")
+
+    @pytest.mark.asyncio
+    async def test_multiple_calls_return_consistent_token(self) -> None:
+        provider = StaticTokenProvider(access_token="consistent-token")
+        t1 = await provider.acquire_token()
+        t2 = await provider.acquire_token()
+        assert t1.access_token == t2.access_token == "consistent-token"
+
+
 # ── Auth: TeamsAuthManager ──
 
 
@@ -271,6 +316,16 @@ class TestTeamsAuthManager:
         await manager.get_access_token()
         await manager.invalidate_and_refresh()
         assert provider.acquire_token.call_count == 2
+
+    @pytest.mark.asyncio
+    async def test_static_token_provider_cached_no_reacquire(self) -> None:
+        """StaticTokenProvider token is cached by TeamsAuthManager — no re-acquire."""
+        provider = StaticTokenProvider(access_token="static-tok")
+        manager = TeamsAuthManager(provider)
+
+        t1 = await manager.get_access_token()
+        t2 = await manager.get_access_token()
+        assert t1 == t2 == "static-tok"
 
 
 # ── GraphClient ──
@@ -1112,6 +1167,18 @@ class TestChannelLifecycle:
         provider = ch._build_auth_provider()
         assert isinstance(provider, PasswordGrantProvider)
 
+    def test_build_auth_provider_token(self) -> None:
+        ch = self._make_channel(auth_mode="token", graph_token="my-graph-token")
+        provider = ch._build_auth_provider()
+        assert isinstance(provider, StaticTokenProvider)
+
+    def test_build_auth_provider_token_empty_raises(self) -> None:
+        from nanobot.channels.teams.channel import TeamsChannel
+
+        config = _make_config(auth_mode="token", graph_token="")
+        with pytest.raises(TeamsAuthError, match="non-empty"):
+            TeamsChannel(config, MessageBus())
+
     def test_build_auth_provider_unsupported(self) -> None:
         from nanobot.channels.teams.channel import TeamsChannel
 
@@ -1153,6 +1220,18 @@ class TestTeamsConfig:
         config = TeamsConfig()
         assert "offline_access" in config.delegated_scopes
         assert any("Chat.ReadWrite" in s for s in config.delegated_scopes)
+
+    def test_graph_token_default_empty(self) -> None:
+        config = TeamsConfig()
+        assert config.graph_token == ""
+
+    def test_graph_token_value(self) -> None:
+        config = TeamsConfig(graph_token="my-token-123")
+        assert config.graph_token == "my-token-123"
+
+    def test_graph_token_camel_case_alias(self) -> None:
+        config = TeamsConfig(**{"graphToken": "camel-tok"})
+        assert config.graph_token == "camel-tok"
 
 
 # ── Additional Coverage Tests ──

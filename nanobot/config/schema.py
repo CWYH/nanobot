@@ -209,9 +209,10 @@ class TeamsConfig(Base):
     client_secret: str = ""  # Optional: used by future interactive flows
 
     # Auth mode (initial + extensible)
-    auth_mode: str = "password"  # "password", "device_code", "fic"
+    auth_mode: str = "password"  # "password", "device_code", "fic", "token"
     username: str = ""  # Service account UPN/email for delegated auth
     password: str = ""  # Service account password (initial bootstrap)
+    graph_token: str = ""  # Pre-acquired Graph API access token (auth_mode="token")
     delegated_scopes: list[str] = Field(
         default_factory=lambda: [
             "offline_access",

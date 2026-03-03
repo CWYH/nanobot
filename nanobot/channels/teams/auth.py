@@ -118,6 +118,26 @@ class PasswordGrantProvider:
         )
 
 
+class StaticTokenProvider:
+    """Provider that returns a pre-acquired access token without any refresh capability."""
+
+    _FAR_FUTURE_S: float = 10 * 365.25 * 24 * 3600  # ~10 years
+
+    def __init__(self, access_token: str) -> None:
+        if not access_token:
+            raise TeamsAuthError("StaticTokenProvider requires a non-empty access_token")
+        self._access_token = access_token
+
+    async def acquire_token(self, force_refresh: bool = False) -> AuthToken:
+        if force_refresh:
+            logger.warning("Teams: StaticTokenProvider cannot refresh — returning original token")
+        return AuthToken(
+            access_token=self._access_token,
+            refresh_token=None,
+            expires_at=time.time() + self._FAR_FUTURE_S,
+        )
+
+
 class TeamsAuthManager:
     """Provider-agnostic token cache/refresh facade used by GraphClient."""
 

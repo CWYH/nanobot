@@ -15,7 +15,9 @@ from nanobot.bus.events import OutboundMessage
 from nanobot.bus.queue import MessageBus
 from nanobot.channels.base import BaseChannel
 from nanobot.channels.teams.auth import (
+    DelegatedTokenProvider,
     PasswordGrantProvider,
+    StaticTokenProvider,
     TeamsAuthManager,
 )
 from nanobot.channels.teams.graph_client import GRAPH_BASE_URL, GraphClient
@@ -64,7 +66,7 @@ class TeamsChannel(BaseChannel):
         self._processed_ids: set[str] = set()
         self._MAX_PROCESSED_IDS: int = 10_000
 
-    def _build_auth_provider(self) -> PasswordGrantProvider:
+    def _build_auth_provider(self) -> DelegatedTokenProvider:
         """Construct the DelegatedTokenProvider based on config.auth_mode."""
         if self.config.auth_mode == "password":
             return PasswordGrantProvider(
@@ -74,6 +76,8 @@ class TeamsChannel(BaseChannel):
                 password=self.config.password,
                 scopes=self.config.delegated_scopes,
             )
+        if self.config.auth_mode == "token":
+            return StaticTokenProvider(access_token=self.config.graph_token)
         raise ValueError(f"Unsupported Teams auth_mode: {self.config.auth_mode}")
 
     async def start(self) -> None:
