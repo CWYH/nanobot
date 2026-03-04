@@ -1608,3 +1608,577 @@ class TestProcessNotificationGroupPolicy:
         )
 
         ch._handle_message.assert_not_called()
+
+
+# ── Polling Mode: Config ──
+
+
+class TestPollingConfig:
+    """Tests for polling-related config fields."""
+
+    def test_default_inbound_mode(self) -> None:
+        config = TeamsConfig()
+        assert config.inbound_mode == "webhook"
+
+    def test_inbound_mode_polling(self) -> None:
+        config = TeamsConfig(inbound_mode="polling")
+        assert config.inbound_mode == "polling"
+
+    def test_inbound_mode_camel_case(self) -> None:
+        config = TeamsConfig(**{"inboundMode": "polling"})
+        assert config.inbound_mode == "polling"
+
+    def test_default_poll_interval_seconds(self) -> None:
+        config = TeamsConfig()
+        assert config.poll_interval_seconds == 10
+
+    def test_custom_poll_interval_seconds(self) -> None:
+        config = TeamsConfig(poll_interval_seconds=30)
+        assert config.poll_interval_seconds == 30
+
+    def test_poll_interval_camel_case(self) -> None:
+        config = TeamsConfig(**{"pollIntervalSeconds": 5})
+        assert config.poll_interval_seconds == 5
+
+    def test_default_poll_batch_size(self) -> None:
+        config = TeamsConfig()
+        assert config.poll_batch_size == 20
+
+    def test_custom_poll_batch_size(self) -> None:
+        config = TeamsConfig(poll_batch_size=50)
+        assert config.poll_batch_size == 50
+
+    def test_default_poll_lookback_minutes(self) -> None:
+        config = TeamsConfig()
+        assert config.poll_lookback_minutes == 30
+
+    def test_custom_poll_lookback_minutes(self) -> None:
+        config = TeamsConfig(poll_lookback_minutes=60)
+        assert config.poll_lookback_minutes == 60
+
+
+# ── Polling Mode: Cursors ──
+
+
+class TestInitCursors:
+    """Tests for cursor initialization."""
+
+    def _make_channel(self, **kw: object) -> "TeamsChannel":
+        from nanobot.channels.teams.channel import TeamsChannel
+
+        config = _make_config(**kw)
+        ch = TeamsChannel(config, MessageBus())
+        return ch
+
+    def test_init_cursors_creates_entries_for_all_subscriptions(self) -> None:
+        ch = self._make_channel(
+            subscriptions=["/chats/a/messages", "/chats/b/messages"]
+        )
+        ch._init_cursors()
+        assert "/chats/a/messages" in ch._resource_cursors
+        assert "/chats/b/messages" in ch._resource_cursors
+
+    def test_init_cursors_timestamp_format(self) -> None:
+        ch = self._make_channel()
+        ch._init_cursors()
+        resource = ch.config.subscriptions[0]
+        ts = ch._resource_cursors[resource]
+        # Should be ISO 8601 format: YYYY-MM-DDTHH:MM:SS.ffffffZ
+        assert "T" in ts
+        assert ts.endswith("Z")
+
+    def test_init_cursors_lookback_applied(self) -> None:
+        from datetime import datetime, timezone
+
+        ch = self._make_channel(poll_lookback_minutes=60)
+        ch._init_cursors()
+        resource = ch.config.subscriptions[0]
+        ts = ch._resource_cursors[resource]
+        # Parse the cursor timestamp and verify it's roughly 60 minutes ago
+        cursor_dt = datetime.strptime(ts, "%Y-%m-%dT%H:%M:%S.%fZ").replace(
+            tzinfo=timezone.utc
+        )
+        now = datetime.now(timezone.utc)
+        diff = (now - cursor_dt).total_seconds()
+        assert 3500 < diff < 3700  # ~60 minutes with some tolerance
+
+
+class TestAdvanceCursor:
+    """Tests for cursor advancement."""
+
+    def _make_channel(self) -> "TeamsChannel":
+        from nanobot.channels.teams.channel import TeamsChannel
+
+        config = _make_config()
+        ch = TeamsChannel(config, MessageBus())
+        ch._resource_cursors = {"/chats/a/messages": "2026-01-01T00:00:00.000000Z"}
+        return ch
+
+    def test_advance_cursor_updates_to_newest(self) -> None:
+        ch = self._make_channel()
+        messages = [
+            {"createdDateTime": "2026-01-01T01:00:00.000000Z"},
+            {"createdDateTime": "2026-01-01T02:00:00.000000Z"},
+            {"createdDateTime": "2026-01-01T00:30:00.000000Z"},
+        ]
+        ch._advance_cursor("/chats/a/messages", messages)
+        assert ch._resource_cursors["/chats/a/messages"] == "2026-01-01T02:00:00.000000Z"
+
+    def test_advance_cursor_no_messages_noop(self) -> None:
+        ch = self._make_channel()
+        ch._advance_cursor("/chats/a/messages", [])
+        assert ch._resource_cursors["/chats/a/messages"] == "2026-01-01T00:00:00.000000Z"
+
+    def test_advance_cursor_does_not_go_backwards(self) -> None:
+        ch = self._make_channel()
+        ch._resource_cursors["/chats/a/messages"] = "2026-01-01T05:00:00.000000Z"
+        messages = [{"createdDateTime": "2026-01-01T03:00:00.000000Z"}]
+        ch._advance_cursor("/chats/a/messages", messages)
+        assert ch._resource_cursors["/chats/a/messages"] == "2026-01-01T05:00:00.000000Z"
+
+
+# ── Polling Mode: Filter & List ──
+
+
+class TestFilterNewMessages:
+    """Tests for _filter_new_messages."""
+
+    def _make_channel(self) -> "TeamsChannel":
+        from nanobot.channels.teams.channel import TeamsChannel
+
+        config = _make_config()
+        ch = TeamsChannel(config, MessageBus())
+        ch._bot_user_id = "bot-id"
+        return ch
+
+    def test_filters_already_processed(self) -> None:
+        ch = self._make_channel()
+        ch._processed_ids.add("msg-1")
+        messages = [
+            {"id": "msg-1", "from": {"user": {"id": "u1"}}},
+            {"id": "msg-2", "from": {"user": {"id": "u2"}}},
+        ]
+        result = ch._filter_new_messages(messages)
+        assert len(result) == 1
+        assert result[0]["id"] == "msg-2"
+
+    def test_filters_bot_messages(self) -> None:
+        ch = self._make_channel()
+        messages = [
+            {"id": "msg-1", "from": {"user": {"id": "bot-id"}}},
+            {"id": "msg-2", "from": {"user": {"id": "u1"}}},
+        ]
+        result = ch._filter_new_messages(messages)
+        assert len(result) == 1
+        assert result[0]["id"] == "msg-2"
+
+    def test_returns_all_when_nothing_to_filter(self) -> None:
+        ch = self._make_channel()
+        messages = [
+            {"id": "msg-1", "from": {"user": {"id": "u1"}}},
+            {"id": "msg-2", "from": {"user": {"id": "u2"}}},
+        ]
+        result = ch._filter_new_messages(messages)
+        assert len(result) == 2
+
+    def test_empty_messages_returns_empty(self) -> None:
+        ch = self._make_channel()
+        result = ch._filter_new_messages([])
+        assert result == []
+
+    def test_no_bot_identity_allows_all(self) -> None:
+        ch = self._make_channel()
+        ch._bot_user_id = None
+        messages = [
+            {"id": "msg-1", "from": {"user": {"id": "any-id"}}},
+        ]
+        result = ch._filter_new_messages(messages)
+        assert len(result) == 1
+
+
+class TestListMessages:
+    """Tests for _list_messages."""
+
+    def _make_channel(self) -> "TeamsChannel":
+        from nanobot.channels.teams.channel import TeamsChannel
+
+        config = _make_config()
+        ch = TeamsChannel(config, MessageBus())
+        ch._graph_client = AsyncMock(spec=GraphClient)
+        return ch
+
+    @pytest.mark.asyncio
+    async def test_chat_resource_does_not_use_filter_or_orderby(self) -> None:
+        """Chat endpoints only support $top."""
+        ch = self._make_channel()
+        ch._resource_cursors = {"/chats/a/messages": "2026-01-01T00:00:00Z"}
+        ch._graph_client.get.return_value = {
+            "value": [
+                {"id": "m1", "createdDateTime": "2026-01-01T01:00:00Z"},
+                {"id": "m2", "createdDateTime": "2025-12-31T00:00:00Z"},
+            ]
+        }
+
+        result = await ch._list_messages("/chats/a/messages", top=10)
+
+        call_kwargs = ch._graph_client.get.call_args
+        params = call_kwargs.kwargs.get("params", {})
+        assert "$filter" not in params
+        assert "$orderby" not in params
+        assert params["$top"] == "10"
+        # Client-side filtering should remove the old message
+        assert len(result) == 1
+        assert result[0]["id"] == "m1"
+
+    @pytest.mark.asyncio
+    async def test_chat_resource_without_cursor_returns_all(self) -> None:
+        ch = self._make_channel()
+        ch._resource_cursors = {}
+        ch._graph_client.get.return_value = {
+            "value": [
+                {"id": "m1", "createdDateTime": "2026-01-01T01:00:00Z"},
+                {"id": "m2", "createdDateTime": "2026-01-01T00:30:00Z"},
+            ]
+        }
+
+        result = await ch._list_messages("/chats/a/messages", top=5)
+        assert len(result) == 2
+
+    @pytest.mark.asyncio
+    async def test_channel_resource_uses_filter_and_orderby(self) -> None:
+        """Channel endpoints support $filter and $orderby."""
+        ch = self._make_channel()
+        resource = "/teams/t1/channels/ch1/messages"
+        ch._resource_cursors = {resource: "2026-01-01T00:00:00Z"}
+        ch._graph_client.get.return_value = {
+            "value": [{"id": "m1", "createdDateTime": "2026-01-01T01:00:00Z"}]
+        }
+
+        result = await ch._list_messages(resource, top=10)
+
+        call_kwargs = ch._graph_client.get.call_args
+        params = call_kwargs.kwargs.get("params", {})
+        assert "$filter" in params
+        assert "2026-01-01T00:00:00Z" in params["$filter"]
+        assert "$orderby" in params
+        assert len(result) == 1
+
+    @pytest.mark.asyncio
+    async def test_channel_resource_without_cursor_no_filter(self) -> None:
+        ch = self._make_channel()
+        resource = "/teams/t1/channels/ch1/messages"
+        ch._resource_cursors = {}
+        ch._graph_client.get.return_value = {"value": [{"id": "m1"}]}
+
+        result = await ch._list_messages(resource, top=5)
+
+        call_kwargs = ch._graph_client.get.call_args
+        params = call_kwargs.kwargs.get("params", {})
+        assert "$filter" not in params
+        assert "$orderby" in params
+        assert len(result) == 1
+
+    @pytest.mark.asyncio
+    async def test_list_messages_empty_response(self) -> None:
+        ch = self._make_channel()
+        ch._graph_client.get.return_value = {}
+
+        result = await ch._list_messages("/chats/a/messages")
+        assert result == []
+
+
+# ── Polling Mode: Process Message (shared) ──
+
+
+class TestProcessMessage:
+    """Tests for the shared _process_message method."""
+
+    def _make_channel(self) -> "TeamsChannel":
+        from nanobot.channels.teams.channel import TeamsChannel
+
+        config = _make_config()
+        ch = TeamsChannel(config, MessageBus())
+        ch._graph_client = AsyncMock(spec=GraphClient)
+        ch._bot_user_id = "bot-user-id"
+        return ch
+
+    @pytest.mark.asyncio
+    async def test_process_message_forwards_to_handle_message(self) -> None:
+        ch = self._make_channel()
+        ch._handle_message = AsyncMock()
+        message = {
+            "id": "msg-pm-1",
+            "from": {"user": {"id": "user-1", "displayName": "Alice"}},
+            "body": {"contentType": "text", "content": "hello via polling"},
+        }
+
+        await ch._process_message("/chats/19:abc@thread.v2/messages/msg-pm-1", message)
+
+        ch._handle_message.assert_called_once()
+        kwargs = ch._handle_message.call_args.kwargs
+        assert kwargs["content"] == "hello via polling"
+        assert kwargs["sender_id"] == "user-1"
+
+    @pytest.mark.asyncio
+    async def test_process_message_dedup(self) -> None:
+        ch = self._make_channel()
+        ch._handle_message = AsyncMock()
+        message = {
+            "id": "msg-dup",
+            "from": {"user": {"id": "user-1", "displayName": "Alice"}},
+            "body": {"contentType": "text", "content": "hello"},
+        }
+
+        await ch._process_message("/chats/19:abc/messages/msg-dup", message)
+        await ch._process_message("/chats/19:abc/messages/msg-dup", message)
+        assert ch._handle_message.call_count == 1
+
+    @pytest.mark.asyncio
+    async def test_process_message_skips_bot_messages(self) -> None:
+        ch = self._make_channel()
+        ch._handle_message = AsyncMock()
+        message = {
+            "id": "msg-bot",
+            "from": {"user": {"id": "bot-user-id", "displayName": "Bot"}},
+            "body": {"contentType": "text", "content": "I said this"},
+        }
+
+        await ch._process_message("/chats/19:abc/messages/msg-bot", message)
+        ch._handle_message.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_process_message_strips_html(self) -> None:
+        ch = self._make_channel()
+        ch._handle_message = AsyncMock()
+        message = {
+            "id": "msg-html-pm",
+            "from": {"user": {"id": "user-1", "displayName": "Alice"}},
+            "body": {"contentType": "html", "content": "<p>Hello <b>world</b></p>"},
+        }
+
+        await ch._process_message("/chats/19:abc/messages/msg-html-pm", message)
+        kwargs = ch._handle_message.call_args.kwargs
+        assert "<p>" not in kwargs["content"]
+        assert "Hello" in kwargs["content"]
+
+    @pytest.mark.asyncio
+    async def test_process_message_handles_error_gracefully(self) -> None:
+        ch = self._make_channel()
+        ch._handle_message = AsyncMock(side_effect=RuntimeError("bus error"))
+        message = {
+            "id": "msg-err",
+            "from": {"user": {"id": "user-1", "displayName": "Alice"}},
+            "body": {"contentType": "text", "content": "hello"},
+        }
+        # Should not raise
+        await ch._process_message("/chats/19:abc/messages/msg-err", message)
+
+
+# ── Polling Mode: Polling Loop ──
+
+
+class TestPollingLoop:
+    """Tests for the polling loop."""
+
+    def _make_channel(self, **kw: object) -> "TeamsChannel":
+        from nanobot.channels.teams.channel import TeamsChannel
+
+        config = _make_config(inbound_mode="polling", **kw)
+        ch = TeamsChannel(config, MessageBus())
+        ch._graph_client = AsyncMock(spec=GraphClient)
+        ch._bot_user_id = "bot-user-id"
+        return ch
+
+    @pytest.mark.asyncio
+    async def test_polling_loop_processes_messages(self) -> None:
+        ch = self._make_channel()
+        ch._resource_cursors = {"/chats/19:abc@thread.v2/messages": "2026-01-01T00:00:00Z"}
+        ch._handle_message = AsyncMock()
+
+        ch._graph_client.get.return_value = {
+            "value": [
+                {
+                    "id": "msg-poll-1",
+                    "createdDateTime": "2026-01-01T01:00:00Z",
+                    "from": {"user": {"id": "user-1", "displayName": "Alice"}},
+                    "body": {"contentType": "text", "content": "polled message"},
+                }
+            ]
+        }
+
+        ch._running = True
+
+        async def _stop_soon() -> None:
+            await asyncio.sleep(0.05)
+            ch._running = False
+
+        asyncio.create_task(_stop_soon())
+        await ch._polling_loop()
+
+        ch._handle_message.assert_called()
+        kwargs = ch._handle_message.call_args.kwargs
+        assert kwargs["content"] == "polled message"
+
+    @pytest.mark.asyncio
+    async def test_polling_loop_handles_api_error(self) -> None:
+        ch = self._make_channel()
+        ch._resource_cursors = {"/chats/19:abc@thread.v2/messages": "2026-01-01T00:00:00Z"}
+        ch._graph_client.get.side_effect = RuntimeError("API error")
+        ch._running = True
+
+        async def _stop_soon() -> None:
+            await asyncio.sleep(0.05)
+            ch._running = False
+
+        asyncio.create_task(_stop_soon())
+        # Should not raise
+        await ch._polling_loop()
+
+    @pytest.mark.asyncio
+    async def test_polling_loop_advances_cursor(self) -> None:
+        ch = self._make_channel()
+        resource = "/chats/19:abc@thread.v2/messages"
+        ch._resource_cursors = {resource: "2026-01-01T00:00:00Z"}
+        ch._handle_message = AsyncMock()
+
+        ch._graph_client.get.return_value = {
+            "value": [
+                {
+                    "id": "msg-adv",
+                    "createdDateTime": "2026-01-01T02:00:00Z",
+                    "from": {"user": {"id": "user-1", "displayName": "Alice"}},
+                    "body": {"contentType": "text", "content": "hi"},
+                }
+            ]
+        }
+
+        ch._running = True
+
+        async def _stop_soon() -> None:
+            await asyncio.sleep(0.05)
+            ch._running = False
+
+        asyncio.create_task(_stop_soon())
+        await ch._polling_loop()
+
+        assert ch._resource_cursors[resource] == "2026-01-01T02:00:00Z"
+
+    @pytest.mark.asyncio
+    async def test_polling_loop_min_interval(self) -> None:
+        """Interval should be clamped to minimum of 3 seconds."""
+        ch = self._make_channel(poll_interval_seconds=1)
+        ch._resource_cursors = {"/chats/19:abc@thread.v2/messages": "2026-01-01T00:00:00Z"}
+        ch._graph_client.get.return_value = {"value": []}
+        ch._running = True
+
+        async def _stop_soon() -> None:
+            await asyncio.sleep(0.05)
+            ch._running = False
+
+        asyncio.create_task(_stop_soon())
+        # Should not raise; the interval is clamped to 3
+        await ch._polling_loop()
+
+
+# ── Polling Mode: Start/Stop ──
+
+
+class TestPollingStartStop:
+    """Tests for start/stop in polling mode."""
+
+    def _make_channel(self, **kw: object) -> "TeamsChannel":
+        from nanobot.channels.teams.channel import TeamsChannel
+
+        config = _make_config(
+            inbound_mode="polling",
+            auth_mode="token",
+            graph_token="test-token",
+            tenant_id="",
+            client_id="",
+            **kw,
+        )
+        ch = TeamsChannel(config, MessageBus())
+        ch._graph_client = AsyncMock(spec=GraphClient)
+        ch._subscription_manager = AsyncMock(spec=SubscriptionManager)
+        return ch
+
+    @pytest.mark.asyncio
+    async def test_start_polling_mode(self) -> None:
+        ch = self._make_channel()
+        ch._graph_client.get.return_value = {"id": "bot-1", "displayName": "Bot"}
+
+        async def _stop_soon() -> None:
+            await asyncio.sleep(0.05)
+            ch._running = False
+
+        asyncio.create_task(_stop_soon())
+        await ch.start()
+
+        assert ch._bot_user_id == "bot-1"
+        # In polling mode, no subscriptions should be created
+        ch._subscription_manager.create_all.assert_not_called()
+        # Cursors should be initialized
+        assert len(ch._resource_cursors) > 0
+
+    @pytest.mark.asyncio
+    async def test_start_polling_returns_early_without_subscriptions(self) -> None:
+        ch = self._make_channel(subscriptions=[])
+        await ch.start()
+        assert not hasattr(ch, "_running") or ch.is_running is False
+
+    @pytest.mark.asyncio
+    async def test_start_token_mode_without_tenant_id(self) -> None:
+        """Token auth mode should not require tenant_id/client_id."""
+        ch = self._make_channel()
+        ch._graph_client.get.return_value = {"id": "bot-1", "displayName": "Bot"}
+
+        async def _stop_soon() -> None:
+            await asyncio.sleep(0.05)
+            ch._running = False
+
+        asyncio.create_task(_stop_soon())
+        await ch.start()
+        # Should have started successfully despite empty tenant_id/client_id
+        assert ch._bot_user_id == "bot-1"
+
+    @pytest.mark.asyncio
+    async def test_stop_polling_mode(self) -> None:
+        ch = self._make_channel()
+        ch._running = True
+        ch._polling_task = asyncio.create_task(asyncio.sleep(999))
+        ch._runner = None
+
+        await ch.stop()
+
+        assert ch._running is False
+        assert ch._polling_task is None
+        ch._graph_client.close.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_stop_polling_without_task(self) -> None:
+        ch = self._make_channel()
+        ch._running = True
+        ch._polling_task = None
+        ch._runner = None
+
+        await ch.stop()
+
+        assert ch._running is False
+
+    @pytest.mark.asyncio
+    async def test_start_webhook_still_requires_webhook_host(self) -> None:
+        """Webhook mode with token auth still requires webhook_host."""
+        from nanobot.channels.teams.channel import TeamsChannel
+
+        config = _make_config(
+            inbound_mode="webhook",
+            auth_mode="token",
+            graph_token="test-token",
+            webhook_host="",
+        )
+        ch = TeamsChannel(config, MessageBus())
+        ch._graph_client = AsyncMock(spec=GraphClient)
+        ch._graph_client.get.return_value = {"id": "bot-1", "displayName": "Bot"}
+
+        await ch.start()
+        assert ch.is_running is False

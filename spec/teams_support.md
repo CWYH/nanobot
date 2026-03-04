@@ -14,6 +14,7 @@ conversations**, following the same `BaseChannel` contract used by all other nan
 | Team channel messages (receive & send) | Back-in-time message migration |
 | Group chat messages (receive & send) | File/attachment uploads |
 | User-delegated Graph authentication (token provider abstraction) | Adaptive Cards / rich card rendering |
+| Configurable inbound mode (`webhook` / `polling`) | `/teams/getAllMessages` tenant-wide subscriptions |
 | Subscription lifecycle management | `/teams/getAllMessages` tenant-wide subscriptions |
 | Rate limiting & retry | Cross-tenant on-behalf-of token exchange |
 | Username/password token bootstrap (non-MFA tenants) | OAuth token storage in external secret vault |
@@ -40,9 +41,14 @@ Python async/`httpx`.
 
 ### 2.1 Transport Model
 
-Unlike most nanobot channels (WebSocket / Long Polling), the Graph API requires a **webhook push
-model** for receiving messages. This is the only nanobot channel that must expose a public HTTP
-endpoint.
+Teams inbound supports two modes:
+
+1. **`webhook` mode (default)** — Graph change notifications + webhook callback.
+2. **`polling` mode** — periodic Graph message polling for configured resources.
+
+`webhook` mode has lower receive latency and lower steady-state API usage, but requires a public
+HTTPS callback endpoint. `polling` mode does not require any public endpoint and is suitable for
+local/private deployments.
 
 ```
 ┌─────────────────────────────────────────────────────────────────────┐
@@ -77,12 +83,19 @@ endpoint.
 
 ### 2.2 Inbound (Receiving Messages)
 
-1. On `start()`, create a Graph API **change notification subscription** for the configured
-   resource(s).
+`inbound_mode=webhook`:
+
+1. On `start()`, create Graph API **change notification subscriptions** for configured resources.
 2. Graph API pushes notifications to the webhook endpoint.
-3. Webhook handler fetches full message content via a separate GET call (to avoid encryption
-   complexity).
+3. Webhook handler fetches full message content via a separate GET call.
 4. Message is forwarded to the `MessageBus` via `_handle_message()`.
+
+`inbound_mode=polling`:
+
+1. On `start()`, initialize per-resource cursors/checkpoints.
+2. Periodically call Graph message list endpoints for each configured resource.
+3. Sort/filter by timestamp + message ID, skip already-seen/self messages.
+4. Forward new messages to `MessageBus` via `_handle_message()`.
 
 ### 2.3 Outbound (Sending Messages)
 
@@ -108,9 +121,10 @@ class TeamsConfig(Base):
     client_secret: str = ""      # Optional: used by future interactive flows
 
     # Auth mode (initial + extensible)
-    auth_mode: str = "password"  # "password", "device_code", "fic"
+    auth_mode: str = "password"  # "password", "device_code", "fic", "token"
     username: str = ""           # Service account UPN/email for delegated auth
     password: str = ""           # Service account password (initial bootstrap)
+    graph_token: str = ""        # Pre-acquired Graph API access token (auth_mode="token")
     delegated_scopes: list[str] = Field(
         default_factory=lambda: [
             "offline_access",
@@ -121,12 +135,19 @@ class TeamsConfig(Base):
             "https://graph.microsoft.com/ChannelMessage.Send",
         ]
     )
-    mfa_provider: str = ""        # Reserved extension point (e.g. "device_code", "broker")
 
-    # Webhook server
-    webhook_host: str = ""       # Public HTTPS base URL (e.g. "https://bot.example.com")
+    # Inbound mode
+    inbound_mode: str = "webhook"  # "webhook" | "polling"
+
+    # Webhook server (only used when inbound_mode="webhook")
+    webhook_host: str = ""       # Required in webhook mode: public HTTPS base URL
     webhook_port: int = 18791    # Local HTTP server listen port
     webhook_path: str = "/teams/webhook"
+
+    # Polling mode
+    poll_interval_seconds: int = 10   # Effective only when inbound_mode="polling"
+    poll_batch_size: int = 20         # Per-resource max messages fetched per cycle
+    poll_lookback_minutes: int = 30   # Startup lookback window to initialize cursor
 
     # Subscription targets — at least one required
     # Chat subscriptions: "/chats/{chat-id}/messages" or "/users/{user-id}/chats/getAllMessages"
@@ -168,6 +189,7 @@ class TeamsConfig(Base):
                 "https://graph.microsoft.com/ChannelMessage.Send"
             ],
             "mfaProvider": "",
+            "inboundMode": "webhook",
       "webhookHost": "https://bot.example.com",
       "webhookPort": 18791,
       "subscriptions": [
@@ -177,6 +199,28 @@ class TeamsConfig(Base):
       "allowFrom": ["*"]
     }
   }
+}
+```
+
+Polling-mode local/private deployment example:
+
+```jsonc
+{
+    "channels": {
+        "teams": {
+            "enabled": true,
+            "authMode": "token",
+            "graphToken": "<graph-access-token>",
+            "inboundMode": "polling",
+            "pollIntervalSeconds": 10,
+            "pollBatchSize": 20,
+            "pollLookbackMinutes": 30,
+            "subscriptions": [
+                "/chats/<chat-id>/messages"
+            ],
+            "allowFrom": ["*"]
+        }
+    }
 }
 ```
 
@@ -301,7 +345,8 @@ class TeamsAuthManager:
 
 `TeamsChannel` constructs provider by `auth_mode`:
 
-- `password` (initial): `PasswordGrantProvider`
+- `password` (initial): `PasswordGrantProvider` — username/password ROPC flow
+- `token` (implemented): `StaticTokenProvider` — pre-acquired Graph API access token
 - `device_code` (future): `DeviceCodeProvider`
 - `fic` (future): `FicProvider`
 
@@ -326,30 +371,54 @@ Future MFA support plugs in at provider layer only:
 
 ---
 
-## 6. Inbound: Webhook + Change Notifications
+## 6. Inbound Modes
 
-### 6.1 Webhook HTTP Server
+### 6.1 Webhook Mode (`inbound_mode="webhook"`)
 
 A lightweight `aiohttp` server started inside `TeamsChannel.start()`:
 
 ```python
 async def start(self) -> None:
+    if not self.config.tenant_id or not self.config.client_id:
+        logger.error("Teams: tenant_id and client_id are required")
+        return
+    if not self.config.subscriptions:
+        logger.error("Teams: at least one subscription resource is required")
+        return
+
     self._running = True
 
-    # 1. Start webhook HTTP server
-    app = web.Application()
-    app.router.add_post(self.config.webhook_path, self._handle_webhook)
-    runner = web.AppRunner(app)
-    await runner.setup()
-    site = web.TCPSite(runner, "0.0.0.0", self.config.webhook_port)
-    await site.start()
-    logger.info("Teams webhook listening on port {}", self.config.webhook_port)
+    # Resolve bot identity (needed for self-message filtering in both modes)
+    await self._resolve_bot_identity()
 
-    # 2. Create subscriptions
-    await self._subscription_manager.create_all()
+    if self.config.inbound_mode == "webhook":
+        if not self.config.webhook_host:
+            logger.error("Teams: webhook_host is required for webhook mode")
+            self._running = False
+            return
 
-    # 3. Run renewal loop
-    await self._subscription_manager.renewal_loop()
+        # 1. Start webhook HTTP server
+        app = web.Application()
+        app.router.add_post(self.config.webhook_path, self._handle_webhook)
+        runner = web.AppRunner(app)
+        await runner.setup()
+        site = web.TCPSite(runner, "0.0.0.0", self.config.webhook_port)
+        await site.start()
+        logger.info("Teams webhook listening on port {}", self.config.webhook_port)
+
+        # 2. Create subscriptions
+        await self._subscription_manager.create_all()
+
+        # 3. Run renewal loop
+        self._renewal_task = asyncio.create_task(self._subscription_manager.renewal_loop())
+    else:
+        # Polling mode — no webhook server or subscriptions needed
+        self._init_cursors()
+        self._polling_task = asyncio.create_task(self._polling_loop())
+        logger.info("Teams polling mode started (interval={}s)", self.config.poll_interval_seconds)
+
+    while self._running:
+        await asyncio.sleep(1)
 ```
 
 #### Webhook Handler
@@ -375,7 +444,7 @@ async def _handle_webhook(self, request: web.Request) -> web.Response:
     return web.Response(status=202)
 ```
 
-### 6.2 Notification Processing
+### 6.2 Webhook Notification Processing
 
 ```python
 async def _process_notification(self, notification: dict) -> None:
@@ -505,6 +574,185 @@ class SubscriptionManager:
   50 minutes gives a 5-minute safety buffer.
 - **Re-create on failure** — If renewal fails (e.g., subscription was deleted server-side), the
   manager re-creates it from scratch.
+
+### 6.4 Polling Mode (`inbound_mode="polling"`)
+
+Polling mode loops over configured subscription resources and queries recent messages directly.
+No public HTTPS endpoint or Graph subscriptions are required.
+
+#### 6.4.1 Polling Loop
+
+```python
+async def _polling_loop(self) -> None:
+    interval = max(3, int(self.config.poll_interval_seconds))
+
+    while self._running:
+        for resource in self.config.subscriptions:
+            try:
+                messages = await self._list_messages(resource, top=self.config.poll_batch_size)
+                for message in self._filter_new_messages(resource, messages):
+                    await self._process_message(resource, message)
+            except Exception as e:
+                logger.error("Teams polling failed for {}: {}", resource, e)
+
+        await asyncio.sleep(interval)
+```
+
+#### 6.4.2 Message List API (`_list_messages`)
+
+The `subscriptions` config holds resource paths like `/chats/{chatId}/messages` or
+`/teams/{teamId}/channels/{channelId}/messages`. These paths are reused directly as GET
+endpoints with query parameters for filtering and ordering:
+
+```python
+async def _list_messages(self, resource: str, top: int = 20) -> list[dict]:
+    """Fetch recent messages for a resource path."""
+    cursor_ts = self._resource_cursors.get(resource)
+    url = f"{GRAPH_BASE_URL}/{resource}"
+    params: dict[str, str] = {
+        "$top": str(top),
+        "$orderby": "createdDateTime desc",
+    }
+    if cursor_ts:
+        params["$filter"] = f"createdDateTime gt {cursor_ts}"
+
+    data = await self._graph_client.get(url, params=params)
+    return data.get("value", [])
+```
+
+Graph API endpoints used:
+- **Chat messages**: `GET /v1.0/chats/{chatId}/messages?$top=N&$orderby=createdDateTime desc`
+- **Channel messages**: `GET /v1.0/teams/{teamId}/channels/{channelId}/messages?$top=N&$orderby=createdDateTime desc`
+
+#### 6.4.3 Cursor & Checkpoint
+
+Per-resource cursors track the last-seen message timestamp to avoid re-fetching old messages:
+
+```python
+# In __init__:
+self._resource_cursors: dict[str, str] = {}  # resource -> ISO 8601 timestamp
+
+# On startup (before first poll):
+def _init_cursors(self) -> None:
+    lookback = datetime.now(timezone.utc) - timedelta(minutes=self.config.poll_lookback_minutes)
+    initial_ts = lookback.strftime("%Y-%m-%dT%H:%M:%S.%fZ")
+    for resource in self.config.subscriptions:
+        self._resource_cursors[resource] = initial_ts
+```
+
+After processing messages from a poll cycle, advance the cursor to the most recent
+`createdDateTime`:
+
+```python
+def _advance_cursor(self, resource: str, messages: list[dict]) -> None:
+    if not messages:
+        return
+    newest_ts = max(m.get("createdDateTime", "") for m in messages)
+    if newest_ts > self._resource_cursors.get(resource, ""):
+        self._resource_cursors[resource] = newest_ts
+```
+
+**Design decisions:**
+- Cursors are **in-memory only**. On restart, the lookback window re-initializes from
+  `poll_lookback_minutes`, accepting possible re-processing. The existing `_processed_ids` dedup
+  set handles any duplicates within the overlap window.
+- Persistent cursor storage is a future enhancement (§10.2).
+
+#### 6.4.4 Dedup / New-Message Filtering (`_filter_new_messages`)
+
+Reuses the existing `_processed_ids` dedup set (shared with webhook mode):
+
+```python
+def _filter_new_messages(self, resource: str, messages: list[dict]) -> list[dict]:
+    """Filter out already-processed and bot-own messages, return newest-first."""
+    result = []
+    for msg in messages:
+        msg_id = msg.get("id", "")
+        if msg_id in self._processed_ids:
+            continue
+        # Skip bot's own messages
+        from_user = msg.get("from", {}).get("user", {})
+        if self._bot_user_id and from_user.get("id") == self._bot_user_id:
+            continue
+        result.append(msg)
+    return result
+```
+
+#### 6.4.5 Shared Message Processing (`_process_message`)
+
+Both webhook and polling paths share a common `_process_message` method. The webhook path's
+`_process_notification` fetches the full message via GET then delegates to `_process_message`.
+The polling path already has the full message object and calls `_process_message` directly:
+
+```python
+async def _process_message(self, resource: str, message: dict) -> None:
+    """Process a full message object (shared by webhook and polling paths)."""
+    msg_id = message.get("id", "")
+    if msg_id in self._processed_ids:
+        return
+    self._processed_ids.add(msg_id)
+    self._trim_processed_ids()
+
+    from_user = message.get("from", {}).get("user", {})
+    sender_id = from_user.get("id", "")
+    if self._bot_user_id and sender_id == self._bot_user_id:
+        return
+
+    sender_name = from_user.get("displayName", "")
+    body = message.get("body", {})
+    raw_content = body.get("content", "")
+
+    if body.get("contentType") == "html":
+        content = self._strip_html(raw_content)
+    else:
+        content = raw_content
+
+    chat_id, msg_type, thread_id = self._parse_resource(resource)
+
+    if msg_type == "channel" and not self._is_group_allowed(
+        sender_id, chat_id, msg_type, raw_content
+    ):
+        return
+
+    session_key = None
+    if msg_type == "channel" and thread_id:
+        session_key = f"teams:{chat_id}:{thread_id}"
+
+    await self._handle_message(
+        sender_id=sender_id,
+        chat_id=chat_id,
+        content=content,
+        metadata={
+            "teams": {
+                "message_id": msg_id,
+                "message_type": msg_type,
+                "thread_id": thread_id,
+                "sender_name": sender_name,
+                "resource": resource,
+            }
+        },
+        session_key=session_key,
+    )
+```
+
+The webhook `_process_notification` is simplified to:
+
+```python
+async def _process_notification(self, notification: dict) -> None:
+    resource = notification.get("resource", "")
+    if notification.get("changeType") != "created":
+        return
+    message = await self._graph_client.get(f"{GRAPH_BASE_URL}/{resource}")
+    await self._process_message(resource, message)
+```
+
+#### 6.4.6 Polling Mode Design Notes
+
+- Reuses existing `GraphClient` retry/rate-limit/auth behavior.
+- Uses per-resource cursor/checkpoint (`_resource_cursors`) with `$filter` to avoid re-fetching.
+- Shares `_processed_ids` dedup set with webhook mode for consistent dedup behavior.
+- Keeps self-message filtering and `allowFrom` checks identical to webhook mode.
+- Does not create Graph subscriptions and does not require `webhook_host`.
 
 ---
 
@@ -650,24 +898,24 @@ teams = [
 ]
 ```
 
-`aiohttp` is the only new dependency, used solely for the webhook server. `httpx` is already a
-core nanobot dependency.
+`aiohttp` is only required in `webhook` mode (HTTP callback server). `httpx` is required in both
+`webhook` and `polling` modes.
 
 ---
 
 ## 9. Known Limitations & Trade-offs
 
-### 9.1 Public HTTPS Endpoint Required
+### 9.1 Public HTTPS Endpoint Required (Webhook Mode Only)
 
-Graph API change notifications require a publicly reachable HTTPS URL. Deployment options:
+When `inbound_mode="webhook"`, Graph change notifications require a publicly reachable HTTPS URL.
+Deployment options:
 
 | Method | Use Case |
 |--------|----------|
 | Reverse proxy (nginx/caddy) | Production — terminate TLS at proxy, forward to `webhook_port` |
-| ngrok / Cloudflare Tunnel | Development — `ngrok http 18791` |
 | Azure App Service | Cloud deployment — built-in HTTPS |
 
-This is unique among nanobot channels — all others work without exposing ports.
+When `inbound_mode="polling"`, no public HTTPS endpoint is required.
 
 ### 9.2 Channel Message Sending Constraints
 
@@ -699,6 +947,17 @@ Known trade-off: if tenant disables password grant/ROPC, `password` mode will fa
 - **Subscriptions**: Standard Graph API throttling (429 responses with `Retry-After` header).
 - **GET message content**: Standard Graph API throttling applies.
 
+### 9.5 Polling Trade-offs
+
+- Higher receive latency (depends on `poll_interval_seconds`, minimum 3s).
+- Higher Graph API request volume than webhook mode (one GET per resource per poll cycle).
+- In-memory cursors: on restart, re-processes messages within the `poll_lookback_minutes` window.
+  Dedup via `_processed_ids` prevents duplicate forwarding to the agent, but the lookback window
+  should be kept short (default 30 min) to minimize redundant API calls.
+- `$filter` and `$orderby` support varies by Graph API endpoint. Chat messages generally support
+  `createdDateTime` filtering; some channel message endpoints may not. Implementation should
+  gracefully fall back to client-side filtering if the API rejects the query parameters.
+
 ---
 
 ## 10. Future Extensions
@@ -714,12 +973,13 @@ per message. Requires:
 
 This is an optimization for high-throughput scenarios.
 
-### 10.2 Polling Fallback
+### 10.2 Polling Enhancements
 
-For environments where a public webhook endpoint is impractical, implement a polling mode that
-periodically calls `GET /chats/{id}/messages` with delta queries. Trade-off: higher latency
-(poll interval), higher API quota consumption. This would make Teams behave like Telegram's
-Long Polling model.
+Improve polling efficiency and correctness with:
+
+- Delta-query support where available.
+- Persistent cursor checkpoint storage in workspace state.
+- Adaptive poll interval (slow when idle, fast on recent activity).
 
 ### 10.3 Adaptive Cards
 
@@ -742,28 +1002,41 @@ attachment references.
 
 | File | Action | Description |
 |------|--------|-------------|
-| `nanobot/channels/teams.py` | **Create** | `TeamsChannel` implementation |
-| `nanobot/config/schema.py` | **Modify** | Add `TeamsConfig`, add `teams` field to `ChannelsConfig` |
-| `nanobot/channels/manager.py` | **Modify** | Add Teams channel initialization block |
-| `pyproject.toml` | **Modify** | Add `[project.optional-dependencies] teams` |
-| `tests/test_teams_channel.py` | **Create** | Unit tests |
+| `nanobot/channels/teams/__init__.py` | **Exists** | Package exports |
+| `nanobot/channels/teams/auth.py` | **Exists** | Auth providers (Password, Static, AuthManager) |
+| `nanobot/channels/teams/channel.py` | **Modify** | Add polling mode branch to `start()`/`stop()`, add polling methods |
+| `nanobot/channels/teams/graph_client.py` | **Exists** | Graph API HTTP client wrapper |
+| `nanobot/channels/teams/subscriptions.py` | **Exists** | SubscriptionManager for webhook mode |
+| `nanobot/config/schema.py` | **Modify** | Add polling config fields to `TeamsConfig` |
+| `nanobot/channels/manager.py` | **Exists** | Channel initialization |
+| `tests/test_teams_channel.py` | **Modify** | Add polling-mode unit tests |
 
-### Estimated `teams.py` Structure
+### `TeamsChannel` Method Structure
 
 ```
-nanobot/channels/teams.py
-├── TeamsAuthManager          # Delegated user token facade, token cache
-├── DelegatedTokenProvider    # Provider interface (password/device code/auth code)
-├── GraphClient               # HTTP client wrapper with retry & rate limit
-├── SubscriptionManager       # Subscription CRUD + renewal loop
-└── TeamsChannel(BaseChannel) # Main channel class
-    ├── start()               # Start webhook server + create subscriptions
-    ├── stop()                # Delete subscriptions + shutdown server
-    ├── send()                # Post message to chat or channel
-    ├── _handle_webhook()     # HTTP handler for Graph notifications
-    ├── _process_notification()  # Fetch message + forward to bus
-    ├── _parse_resource()     # Extract chat_id / channel_id from resource path
-    └── _strip_html()         # Clean HTML content from Graph messages
+nanobot/channels/teams/channel.py
+└── TeamsChannel(BaseChannel)
+    ├── start()                    # Branching: webhook vs polling
+    ├── stop()                     # Conditional cleanup for both modes
+    ├── send()                     # Post message to chat or channel
+    │
+    ├── # Webhook-mode methods
+    ├── _handle_webhook()          # HTTP handler for Graph notifications
+    ├── _process_notification()    # Fetch message via GET → _process_message()
+    │
+    ├── # Polling-mode methods
+    ├── _polling_loop()            # Periodic poll loop
+    ├── _list_messages()           # GET /chats/{id}/messages with $filter/$top
+    ├── _filter_new_messages()     # Dedup + skip bot-own messages
+    ├── _init_cursors()            # Initialize per-resource timestamp cursors
+    ├── _advance_cursor()          # Update cursor after processing
+    │
+    ├── # Shared methods (used by both modes)
+    ├── _process_message()         # Core message processing (dedup, parse, forward)
+    ├── _parse_resource()          # Extract chat_id / channel_id from resource path
+    ├── _strip_html()              # Clean HTML content from Graph messages
+    ├── _is_group_allowed()        # Group policy check
+    └── _resolve_bot_identity()    # GET /me to resolve bot user ID
 ```
 
 ---
@@ -775,6 +1048,7 @@ nanobot/channels/teams.py
 - **Auth**: Token acquisition, caching, refresh-before-expiry.
 - **Webhook handler**: Validation token handshake, clientState verification, notification
   parsing, self-message filtering.
+- **Polling loop**: Cursor progression, de-dup, lookback initialization, self-message filtering.
 - **Subscription manager**: Create, renew, delete, re-create on failure.
 - **Send**: Chat vs channel routing, thread reply construction, HTML content type.
 - **Rate limiting**: Semaphore fairness, 429 retry-after, exponential backoff.
@@ -783,8 +1057,9 @@ nanobot/channels/teams.py
 ### 12.2 Integration Tests
 
 - End-to-end with a real Azure AD app registration and a test Teams tenant.
-- Webhook delivery via ngrok.
+- Webhook delivery via self-hosted public HTTPS endpoint (e.g., reverse proxy on cloud VM).
 - Subscription lifecycle over multiple renewal cycles.
+- Polling-only inbound without webhook/public endpoint.
 
 ### 12.3 Mock Strategy
 

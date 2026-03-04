@@ -6,6 +6,7 @@ import asyncio
 import html
 import re
 import secrets
+from datetime import datetime, timedelta, timezone
 from typing import Any
 
 from aiohttp import web
@@ -58,6 +59,10 @@ class TeamsChannel(BaseChannel):
         self._runner: web.AppRunner | None = None
         self._renewal_task: asyncio.Task | None = None
 
+        # Polling state
+        self._polling_task: asyncio.Task | None = None
+        self._resource_cursors: dict[str, str] = {}
+
         # Bot identity (resolved on start)
         self._bot_user_id: str | None = None
         self._bot_display_name: str | None = None
@@ -81,44 +86,58 @@ class TeamsChannel(BaseChannel):
         raise ValueError(f"Unsupported Teams auth_mode: {self.config.auth_mode}")
 
     async def start(self) -> None:
-        """Start webhook server, authenticate, create subscriptions, run renewal loop."""
+        """Start the Teams channel in either webhook or polling mode."""
         if not self.config.tenant_id or not self.config.client_id:
-            logger.error("Teams: tenant_id and client_id are required")
-            return
-        if not self.config.webhook_host:
-            logger.error("Teams: webhook_host is required")
-            return
+            if self.config.auth_mode != "token":
+                logger.error("Teams: tenant_id and client_id are required")
+                return
         if not self.config.subscriptions:
             logger.error("Teams: at least one subscription resource is required")
             return
 
         self._running = True
 
-        # 1. Start webhook HTTP server
-        try:
-            app = web.Application()
-            app.router.add_post(self.config.webhook_path, self._handle_webhook)
-            self._runner = web.AppRunner(app)
-            await self._runner.setup()
-            site = web.TCPSite(self._runner, "0.0.0.0", self.config.webhook_port)
-            await site.start()
-            logger.info("Teams webhook listening on port {}", self.config.webhook_port)
-        except Exception as e:
-            logger.error("Teams: failed to start webhook server: {}", e)
-            self._running = False
-            return
-
-        # 2. Resolve bot identity
+        # Resolve bot identity (needed for self-message filtering in both modes)
         await self._resolve_bot_identity()
 
-        # 3. Create subscriptions
-        try:
-            await self._subscription_manager.create_all()
-        except Exception as e:
-            logger.error("Teams: subscription creation failed: {}", e)
+        if self.config.inbound_mode == "polling":
+            self._init_cursors()
+            self._polling_task = asyncio.create_task(self._polling_loop())
+            logger.info(
+                "Teams polling mode started (interval={}s)",
+                self.config.poll_interval_seconds,
+            )
+        else:
+            # Webhook mode
+            if not self.config.webhook_host:
+                logger.error("Teams: webhook_host is required for webhook mode")
+                self._running = False
+                return
 
-        # 4. Run renewal loop
-        self._renewal_task = asyncio.create_task(self._subscription_manager.renewal_loop())
+            # 1. Start webhook HTTP server
+            try:
+                app = web.Application()
+                app.router.add_post(self.config.webhook_path, self._handle_webhook)
+                self._runner = web.AppRunner(app)
+                await self._runner.setup()
+                site = web.TCPSite(self._runner, "0.0.0.0", self.config.webhook_port)
+                await site.start()
+                logger.info("Teams webhook listening on port {}", self.config.webhook_port)
+            except Exception as e:
+                logger.error("Teams: failed to start webhook server: {}", e)
+                self._running = False
+                return
+
+            # 2. Create subscriptions
+            try:
+                await self._subscription_manager.create_all()
+            except Exception as e:
+                logger.error("Teams: subscription creation failed: {}", e)
+
+            # 3. Run renewal loop
+            self._renewal_task = asyncio.create_task(
+                self._subscription_manager.renewal_loop()
+            )
 
         # Block until stopped
         while self._running:
@@ -127,6 +146,14 @@ class TeamsChannel(BaseChannel):
     async def stop(self) -> None:
         """Stop all resources."""
         self._running = False
+
+        if self._polling_task:
+            self._polling_task.cancel()
+            try:
+                await self._polling_task
+            except asyncio.CancelledError:
+                pass
+            self._polling_task = None
 
         if self._renewal_task:
             self._renewal_task.cancel()
@@ -193,15 +220,16 @@ class TeamsChannel(BaseChannel):
         """Process a single Graph API change notification."""
         try:
             resource = notification.get("resource", "")
-            change_type = notification.get("changeType", "")
-
-            if change_type != "created":
+            if notification.get("changeType") != "created":
                 return
-
-            # Fetch full message content
             message = await self._graph_client.get(f"{GRAPH_BASE_URL}/{resource}")
+            await self._process_message(resource, message)
+        except Exception:
+            logger.exception("Teams: error processing notification")
 
-            # Dedup
+    async def _process_message(self, resource: str, message: dict[str, Any]) -> None:
+        """Process a full message object (shared by webhook and polling paths)."""
+        try:
             msg_id = message.get("id", "")
             if msg_id in self._processed_ids:
                 return
@@ -252,7 +280,7 @@ class TeamsChannel(BaseChannel):
                 session_key=session_key,
             )
         except Exception:
-            logger.exception("Teams: error processing notification")
+            logger.exception("Teams: error processing message")
 
     def _parse_resource(self, resource: str) -> tuple[str, str, str | None]:
         """Parse Graph API resource path to extract routing info."""
@@ -326,3 +354,84 @@ class TeamsChannel(BaseChannel):
         """Trim dedup cache when it exceeds the max."""
         if len(self._processed_ids) > self._MAX_PROCESSED_IDS:
             self._processed_ids.clear()
+
+    # ── Polling mode ──
+
+    def _init_cursors(self) -> None:
+        """Initialize per-resource cursors from poll_lookback_minutes."""
+        lookback = datetime.now(timezone.utc) - timedelta(
+            minutes=self.config.poll_lookback_minutes
+        )
+        initial_ts = lookback.strftime("%Y-%m-%dT%H:%M:%S.%fZ")
+        for resource in self.config.subscriptions:
+            self._resource_cursors[resource] = initial_ts
+
+    async def _polling_loop(self) -> None:
+        """Periodically poll configured resources for new messages."""
+        interval = max(3, int(self.config.poll_interval_seconds))
+
+        while self._running:
+            for resource in self.config.subscriptions:
+                try:
+                    messages = await self._list_messages(
+                        resource, top=self.config.poll_batch_size
+                    )
+                    new_messages = self._filter_new_messages(messages)
+                    for message in new_messages:
+                        await self._process_message(resource, message)
+                    self._advance_cursor(resource, new_messages)
+                except Exception as e:
+                    logger.error("Teams polling failed for {}: {}", resource, e)
+
+            await asyncio.sleep(interval)
+
+    async def _list_messages(self, resource: str, top: int = 20) -> list[dict[str, Any]]:
+        """Fetch recent messages for a resource path.
+
+        Chat endpoints (``/chats/{id}/messages``) only support ``$top`` —
+        ``$filter`` and ``$orderby`` are not allowed.  Channel endpoints
+        (``/teams/{id}/channels/{id}/messages``) support all three.  We detect
+        the resource type and build params accordingly, applying cursor-based
+        filtering client-side for chats.
+        """
+        cursor_ts = self._resource_cursors.get(resource)
+        url = f"{GRAPH_BASE_URL}/{resource}"
+        is_chat = "/chats/" in resource
+
+        params: dict[str, str] = {"$top": str(top)}
+        if not is_chat:
+            params["$orderby"] = "createdDateTime desc"
+            if cursor_ts:
+                params["$filter"] = f"createdDateTime gt {cursor_ts}"
+
+        data = await self._graph_client.get(url, params=params)
+        messages: list[dict[str, Any]] = data.get("value", [])
+
+        # Client-side cursor filtering for chat endpoints
+        if is_chat and cursor_ts:
+            messages = [m for m in messages if m.get("createdDateTime", "") > cursor_ts]
+
+        return messages
+
+    def _filter_new_messages(
+        self, messages: list[dict[str, Any]]
+    ) -> list[dict[str, Any]]:
+        """Filter out already-processed and bot-own messages."""
+        result: list[dict[str, Any]] = []
+        for msg in messages:
+            msg_id = msg.get("id", "")
+            if msg_id in self._processed_ids:
+                continue
+            from_user = msg.get("from", {}).get("user", {})
+            if self._bot_user_id and from_user.get("id") == self._bot_user_id:
+                continue
+            result.append(msg)
+        return result
+
+    def _advance_cursor(self, resource: str, messages: list[dict[str, Any]]) -> None:
+        """Advance the per-resource cursor to the newest createdDateTime."""
+        if not messages:
+            return
+        newest_ts = max(m.get("createdDateTime", "") for m in messages)
+        if newest_ts > self._resource_cursors.get(resource, ""):
+            self._resource_cursors[resource] = newest_ts

@@ -213,6 +213,10 @@ class TeamsConfig(Base):
     username: str = ""  # Service account UPN/email for delegated auth
     password: str = ""  # Service account password (initial bootstrap)
     graph_token: str = ""  # Pre-acquired Graph API access token (auth_mode="token")
+
+    # Inbound mode
+    inbound_mode: str = "webhook"  # "webhook" | "polling"
+
     delegated_scopes: list[str] = Field(
         default_factory=lambda: [
             "offline_access",
@@ -228,6 +232,11 @@ class TeamsConfig(Base):
     webhook_host: str = ""  # Public HTTPS base URL (e.g. "https://bot.example.com")
     webhook_port: int = 18791
     webhook_path: str = "/teams/webhook"
+
+    # Polling mode (only used when inbound_mode="polling")
+    poll_interval_seconds: int = 10
+    poll_batch_size: int = 20
+    poll_lookback_minutes: int = 30
 
     # Subscription targets
     subscriptions: list[str] = Field(default_factory=list)
