@@ -4,6 +4,7 @@ x-common-config: &common-config
     dockerfile: Dockerfile
   volumes:
     - ~/.nanobot:/root/.nanobot
+    - ~/.config/litellm:/root/.config/litellm
 
 services:
   nanobot-gateway:

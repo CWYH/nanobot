@@ -1,3 +1,8 @@
+---
+name: agent-team
+description: Orchestrate a multi-role software engineering team (Project Lead, Architect, Implementer, Reviewer) to plan, design, implement, test, and review a task iteratively until quality gates pass. Use when the user asks for coordinated team execution, role-based collaboration, or end-to-end delivery with explicit planning and review loops.
+---
+
 # Agent Team Skill
 
 This skill orchestrates a software engineering team of specialized agents to collaboratively plan, design, implement, and review a feature or task.
