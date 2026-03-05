@@ -34,6 +34,7 @@ class PasswordGrantProvider:
     """Username/password (ROPC) token acquisition for non-MFA service accounts."""
 
     TOKEN_URL = "https://login.microsoftonline.com/{tenant_id}/oauth2/v2.0/token"
+    GRAPH_DEFAULT_SCOPE = "https://graph.microsoft.com/.default"
 
     def __init__(
         self,
@@ -49,6 +50,16 @@ class PasswordGrantProvider:
         self._password = password
         self._scopes = scopes
         self._refresh_token: str | None = None
+
+    def _effective_scope(self) -> str:
+        """Return scope string for ROPC requests.
+
+        Match Graph SDK/Azure.Identity behavior by preferring Graph .default,
+        while keeping existing configured scopes as fallback.
+        """
+        if any("graph.microsoft.com" in scope for scope in self._scopes):
+            return self.GRAPH_DEFAULT_SCOPE
+        return " ".join(self._scopes)
 
     async def acquire_token(self, force_refresh: bool = False) -> AuthToken:
         """Acquire token via refresh grant (if available) or password grant."""
@@ -72,7 +83,7 @@ class PasswordGrantProvider:
             "client_id": self._client_id,
             "username": self._username,
             "password": self._password,
-            "scope": " ".join(self._scopes),
+            "scope": self._effective_scope(),
         }
         at_idx = self._username.find("@")
         if at_idx >= 0:
@@ -99,7 +110,7 @@ class PasswordGrantProvider:
             "grant_type": "refresh_token",
             "client_id": self._client_id,
             "refresh_token": refresh_token,
-            "scope": " ".join(self._scopes),
+            "scope": self._effective_scope(),
         }
 
         async with httpx.AsyncClient() as client:
