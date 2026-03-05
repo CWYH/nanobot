@@ -115,6 +115,29 @@ Channels (Telegram, Slack, etc.)
 
 User config lives at `~/.nanobot/config.json`. The workspace defaults to `~/.nanobot/workspace/`. Config schema uses Pydantic with camelCase JSON keys mapped to snake_case Python attributes.
 
+### Multi-Bot Deployment
+
+Each bot can run with its own config via `--config / -c` or `NANOBOT_CONFIG` env var. Data directory (workspace, cron, sessions) is automatically derived from the config file's parent directory.
+
+Bot configs can be stored under your project config directory, for example: `./config/config_*.json`
+
+```bash
+# Start a single bot with uv
+uv run nanobot gateway --config ./config/config_nano0.json
+
+# Start multiple bots via Docker (auto-discovers config_*.json, generates compose file)
+uv run python scripts/start_bots.py -d
+
+# Start specific bots only
+uv run python scripts/start_bots.py -d --bots nano0 nano1
+
+# Skip image rebuild
+uv run python scripts/start_bots.py -d --no-build
+
+# Stop all bots
+uv run python scripts/start_bots.py --down
+```
+
 ## Security Notes
 
 - `allowFrom` on channels: empty list means deny-all in current source (post-v0.1.4.post3). Use `["*"]` for allow-all.

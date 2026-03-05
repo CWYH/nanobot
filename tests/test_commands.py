@@ -17,11 +17,12 @@ runner = CliRunner()
 @pytest.fixture
 def mock_paths():
     """Mock config/workspace paths for test isolation."""
-    with patch("nanobot.config.loader.get_config_path") as mock_cp, \
-         patch("nanobot.config.loader.save_config") as mock_sc, \
-         patch("nanobot.config.loader.load_config") as mock_lc, \
-         patch("nanobot.utils.helpers.get_workspace_path") as mock_ws:
-
+    with (
+        patch("nanobot.config.loader.get_config_path") as mock_cp,
+        patch("nanobot.config.loader.save_config") as mock_sc,
+        patch("nanobot.config.loader.load_config") as mock_lc,
+        patch("nanobot.utils.helpers.get_workspace_path") as mock_ws,
+    ):
         base_dir = Path("./test_onboard_data")
         if base_dir.exists():
             shutil.rmtree(base_dir)
@@ -32,7 +33,7 @@ def mock_paths():
 
         mock_cp.return_value = config_file
         mock_ws.return_value = workspace_dir
-        mock_sc.side_effect = lambda config: config_file.write_text("{}")
+        mock_sc.side_effect = lambda config, **kwargs: config_file.write_text("{}")
 
         yield config_file, workspace_dir
 

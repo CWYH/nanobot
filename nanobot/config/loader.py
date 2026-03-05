@@ -1,20 +1,39 @@
 """Configuration loading utilities."""
 
 import json
+import os
 from pathlib import Path
 
 from nanobot.config.schema import Config
 
 
 def get_config_path() -> Path:
-    """Get the default configuration file path."""
+    """Get the configuration file path.
+
+    Resolution order:
+    1. NANOBOT_CONFIG environment variable (if set and non-empty)
+    2. Default: ~/.nanobot/config.json
+    """
+    env_path = os.environ.get("NANOBOT_CONFIG", "").strip()
+    if env_path:
+        return Path(env_path).expanduser().resolve()
     return Path.home() / ".nanobot" / "config.json"
 
 
-def get_data_dir() -> Path:
-    """Get the nanobot data directory."""
-    from nanobot.utils.helpers import get_data_path
-    return get_data_path()
+def get_data_dir(config_path: Path | None = None) -> Path:
+    """Get the nanobot data directory, derived from the config file location.
+
+    The data directory is the parent directory of the config file.
+    For config at ~/.nanobot/config.json, data dir is ~/.nanobot/.
+    For config at /opt/bots/bot1/config.json, data dir is /opt/bots/bot1/.
+
+    Args:
+        config_path: Explicit config file path. If None, uses get_config_path().
+    """
+    from nanobot.utils.helpers import ensure_dir
+
+    path = config_path or get_config_path()
+    return ensure_dir(path.resolve().parent)
 
 
 def load_config(config_path: Path | None = None) -> Config:

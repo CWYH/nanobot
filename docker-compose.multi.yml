@@ -1,0 +1,61 @@
+# docker-compose.multi.yml
+# Multi-bot deployment: each service has isolated config, data, and port.
+#
+# Prepare directories first:
+#   mkdir -p ~/.nanobot/instances/bot1 ~/.nanobot/instances/bot2
+#   cp ~/.nanobot/config.json ~/.nanobot/instances/bot1/config.json
+#   cp ~/.nanobot/config.json ~/.nanobot/instances/bot2/config.json
+#   # Edit each config.json: set unique channel tokens, gateway.port, workspace path, etc.
+#
+# Each bot's config.json should set:
+#   "agents": { "defaults": { "workspace": "/data/workspace" } }
+#   "gateway": { "port": <matching container port> }
+#
+# Usage:
+#   docker compose -f docker-compose.multi.yml up -d
+
+x-common-config: &common-config
+  build:
+    context: .
+    dockerfile: Dockerfile
+  volumes:
+    - ~/.config/litellm:/root/.config/litellm
+
+services:
+  bot1:
+    container_name: nanobot-bot1
+    <<: *common-config
+    command: ["gateway", "--config", "/data/config.json"]
+    restart: unless-stopped
+    volumes:
+      - ~/.nanobot/instances/bot1:/data
+      - ~/.config/litellm:/root/.config/litellm
+    ports:
+      - "18790:18790"
+    deploy:
+      resources:
+        limits:
+          cpus: "1"
+          memory: 1G
+        reservations:
+          cpus: "0.25"
+          memory: 256M
+
+  bot2:
+    container_name: nanobot-bot2
+    <<: *common-config
+    command: ["gateway", "--config", "/data/config.json"]
+    restart: unless-stopped
+    volumes:
+      - ~/.nanobot/instances/bot2:/data
+      - ~/.config/litellm:/root/.config/litellm
+    ports:
+      - "18791:18791"
+    deploy:
+      resources:
+        limits:
+          cpus: "1"
+          memory: 1G
+        reservations:
+          cpus: "0.25"
+          memory: 256M
