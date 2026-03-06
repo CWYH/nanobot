@@ -273,6 +273,73 @@ class ChannelsConfig(Base):
     teams: TeamsConfig = Field(default_factory=TeamsConfig)
 
 
+class PersonaConfig(Base):
+    """Role persona configuration for multi-bot team discussions."""
+
+    style: str = ""
+    goals: list[str] = Field(default_factory=list)
+    dont: list[str] = Field(default_factory=list)
+
+
+class OrgConfig(Base):
+    """Organizational hierarchy for multi-bot team discussions."""
+
+    manager: str | None = None
+    subordinates: list[str] = Field(default_factory=list)
+    peers: list[str] = Field(default_factory=list)
+
+
+class DiscussionPrinciplesConfig(Base):
+    """Discussion behavioral principles injected into IDENTITY.md (spec §4.5, §4.6)."""
+
+    research_before_answer: bool = True  # §4.5 — all bots
+    topic_selection: bool = False  # §4.6 — manager only
+    extra_rules: list[str] = Field(default_factory=list)
+
+
+class IdentityConfig(Base):
+    """Role identity configuration for multi-bot team discussions (§3.1)."""
+
+    role_id: str = ""
+    display_name: str = ""
+    team_members: dict[str, str] = Field(default_factory=dict)  # role_id → display_name
+    persona: PersonaConfig = Field(default_factory=PersonaConfig)
+    org: OrgConfig = Field(default_factory=OrgConfig)
+    discussion_principles: DiscussionPrinciplesConfig = Field(
+        default_factory=DiscussionPrinciplesConfig
+    )
+
+
+class ReplyDelayConfig(Base):
+    """Reply delay for natural pacing and anti-stampede (spec §4.4)."""
+
+    enabled: bool = False
+    base_delay_sec: float = 5.0  # Agent-layer: simulated thinking time
+    jitter_sec: float = 10.0  # Channel-layer: random additional delay [0, jitter_sec)
+    per_100_chars_sec: float = 1.0  # Scale delay by response length
+    max_delay_sec: float = 30.0  # Total delay cap
+
+
+DISCUSSION_REPLY_DELAY_DEFAULTS = ReplyDelayConfig(
+    enabled=True,
+    base_delay_sec=15.0,
+    jitter_sec=30.0,
+    per_100_chars_sec=2.0,
+    max_delay_sec=120.0,
+)
+
+
+class DiscussionConfig(Base):
+    """Continuous discussion / idle detection configuration (§4.2)."""
+
+    enabled: bool = False
+    idle_warn_after_sec: int = 300  # 5 min — light reminder
+    idle_nudge_after_sec: int = 900  # 15 min — strong reminder (roll‑call)
+    idle_new_topic_after_sec: int = 1800  # 30 min — new topic
+    max_consecutive_manager_nudges: int = 2  # backoff after N unanswered nudges
+    reply_delay_override: ReplyDelayConfig | None = None
+
+
 class AgentDefaults(Base):
     """Default agent configuration."""
 
@@ -286,6 +353,8 @@ class AgentDefaults(Base):
     max_tool_iterations: int = 40
     memory_window: int = 100
     reasoning_effort: str | None = None  # low / medium / high — enables LLM thinking mode
+    identity: IdentityConfig | None = None  # Role identity for multi-bot team discussions
+    reply_delay: ReplyDelayConfig = Field(default_factory=ReplyDelayConfig)
 
 
 class AgentsConfig(Base):
@@ -394,6 +463,7 @@ class Config(BaseSettings):
     providers: ProvidersConfig = Field(default_factory=ProvidersConfig)
     gateway: GatewayConfig = Field(default_factory=GatewayConfig)
     tools: ToolsConfig = Field(default_factory=ToolsConfig)
+    discussion: DiscussionConfig = Field(default_factory=DiscussionConfig)
 
     @property
     def workspace_path(self) -> Path:

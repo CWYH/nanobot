@@ -8,7 +8,6 @@ from typing import Any
 
 from loguru import logger
 
-from nanobot.bus.events import OutboundMessage
 from nanobot.bus.queue import MessageBus
 from nanobot.channels.base import BaseChannel
 from nanobot.config.schema import Config
@@ -234,6 +233,12 @@ class ChannelManager:
                 channel = self.channels.get(msg.channel)
                 if channel:
                     try:
+                        # Anti-stampede jitter (spec §4.4)
+                        rd = self.config.agents.defaults.reply_delay
+                        if rd.enabled and rd.jitter_sec > 0 and not msg.metadata.get("_progress"):
+                            import random
+
+                            await asyncio.sleep(random.uniform(0, rd.jitter_sec))
                         await channel.send(msg)
                     except Exception as e:
                         logger.error("Error sending to {}: {}", msg.channel, e)

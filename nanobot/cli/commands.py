@@ -310,6 +310,35 @@ def gateway(
     console.print(f"{__logo__} Starting nanobot gateway on port {effective_port}...")
 
     sync_workspace_templates(cfg.workspace_path)
+
+    # Generate IDENTITY.md from config identity section (spec §3.2).
+    # Overwrites on every startup so the workspace always matches the config.
+    identity_cfg = cfg.agents.defaults.identity
+    if identity_cfg and identity_cfg.role_id:
+        from nanobot.utils.helpers import generate_identity_md
+
+        identity_md = generate_identity_md(identity_cfg)
+        (cfg.workspace_path / "IDENTITY.md").write_text(identity_md, encoding="utf-8")
+        console.print(
+            f"[green]✓[/green] Identity: {identity_cfg.display_name or identity_cfg.role_id}"
+        )
+
+    # Auto-apply discussion reply delay when discussion mode is enabled
+    # but reply_delay was not explicitly configured.
+    if cfg.discussion.enabled and not cfg.agents.defaults.reply_delay.enabled:
+        from nanobot.config.schema import DISCUSSION_REPLY_DELAY_DEFAULTS
+
+        effective = cfg.discussion.reply_delay_override or DISCUSSION_REPLY_DELAY_DEFAULTS
+        cfg.agents.defaults.reply_delay = effective
+
+    rd = cfg.agents.defaults.reply_delay
+    if rd.enabled:
+        console.print(
+            f"[green]✓[/green] ReplyDelay: base={rd.base_delay_sec}s "
+            f"jitter={rd.jitter_sec}s per100c={rd.per_100_chars_sec}s "
+            f"max={rd.max_delay_sec}s"
+        )
+
     bus = MessageBus()
     provider = _make_provider(cfg)
     session_manager = SessionManager(cfg.workspace_path)
@@ -338,6 +367,7 @@ def gateway(
         session_manager=session_manager,
         mcp_servers=cfg.tools.mcp_servers,
         channels_config=cfg.channels,
+        reply_delay=cfg.agents.defaults.reply_delay,
     )
 
     # Set cron callback (needs agent)
@@ -400,6 +430,14 @@ def gateway(
                 continue
             if channel in enabled and chat_id:
                 return channel, chat_id
+        # Fallback: derive chat_id from Teams subscription resource paths.
+        if "teams" in enabled and cfg.channels.teams.subscriptions:
+            from nanobot.channels.teams.channel import _CHAT_MSG_RE
+
+            for resource in cfg.channels.teams.subscriptions:
+                m = _CHAT_MSG_RE.search(resource)
+                if m:
+                    return "teams", m.group("chat_id")
         # Fallback keeps prior behavior but remains explicit.
         return "cli", "direct"
 
@@ -441,6 +479,48 @@ def gateway(
         enabled=hb_cfg.enabled,
     )
 
+    # ------------------------------------------------------------------
+    # Idle monitor for team discussion (spec §4.1–§4.3)
+    # Only activates when discussion.enabled=true AND identity is manager.
+    # ------------------------------------------------------------------
+    idle_monitor = None
+    is_manager = bool(identity_cfg and identity_cfg.role_id == "manager") if identity_cfg else False
+
+    if cfg.discussion.enabled and is_manager:
+        from nanobot.discussion.idle import IdleMonitor
+
+        async def _on_idle_nudge(prompt: str) -> None:
+            """Send an idle nudge through the agent and deliver to the group."""
+            channel, chat_id = _pick_heartbeat_target()
+            if channel == "cli":
+                return  # No external channel — nothing to nudge
+            response = await agent.process_direct(
+                prompt,
+                session_key=f"idle:{channel}:{chat_id}",
+                channel=channel,
+                chat_id=chat_id,
+            )
+            if response:
+                from nanobot.bus.events import OutboundMessage
+
+                await bus.publish_outbound(
+                    OutboundMessage(channel=channel, chat_id=chat_id, content=response)
+                )
+
+        idle_monitor = IdleMonitor(
+            discussion_cfg=cfg.discussion,
+            on_nudge=_on_idle_nudge,
+        )
+
+        # Hook inbound messages to reset the idle timer.
+        _orig_publish_inbound = bus.publish_inbound
+
+        async def _publish_inbound_with_idle(msg):
+            idle_monitor.record_activity()
+            await _orig_publish_inbound(msg)
+
+        bus.publish_inbound = _publish_inbound_with_idle
+
     if channels.enabled_channels:
         console.print(f"[green]✓[/green] Channels enabled: {', '.join(channels.enabled_channels)}")
     else:
@@ -452,18 +532,78 @@ def gateway(
 
     console.print(f"[green]✓[/green] Heartbeat: every {hb_cfg.interval_s}s")
 
+    if idle_monitor:
+        console.print(
+            f"[green]✓[/green] IdleMonitor: warn={cfg.discussion.idle_warn_after_sec}s "
+            f"nudge={cfg.discussion.idle_nudge_after_sec}s "
+            f"topic={cfg.discussion.idle_new_topic_after_sec}s"
+        )
+
+    # ------------------------------------------------------------------
+    # Opening messages — manager greets each subscribed Teams chat on startup.
+    # ------------------------------------------------------------------
+    async def _send_opening_messages():
+        """Manager sends an opening message to each Teams subscription chat."""
+        if not (cfg.channels.teams.enabled and cfg.channels.teams.subscriptions):
+            return
+        from loguru import logger
+
+        from nanobot.channels.teams.channel import _CHAT_MSG_RE
+        from nanobot.discussion.idle import build_opening_prompt
+
+        # Build list of other team members' display names for @mentions.
+        participant_names: list[str] = []
+        if identity_cfg and identity_cfg.team_members:
+            participant_names = [
+                dname
+                for rid, dname in identity_cfg.team_members.items()
+                if rid != identity_cfg.role_id
+            ]
+        opening_prompt = build_opening_prompt(participant_names)
+
+        for resource in cfg.channels.teams.subscriptions:
+            m = _CHAT_MSG_RE.search(resource)
+            if not m:
+                continue
+            chat_id = m.group("chat_id")
+            try:
+                response = await agent.process_direct(
+                    opening_prompt,
+                    session_key=f"teams:{chat_id}",
+                    channel="teams",
+                    chat_id=chat_id,
+                )
+                if response:
+                    from nanobot.bus.events import OutboundMessage
+
+                    await bus.publish_outbound(
+                        OutboundMessage(channel="teams", chat_id=chat_id, content=response)
+                    )
+                    logger.info("Opening message sent to teams:{}", chat_id)
+                    if idle_monitor:
+                        idle_monitor.record_activity()
+            except Exception:
+                logger.exception("Failed to send opening message to teams:{}", chat_id)
+
     async def run():
         try:
             await cron.start()
             await heartbeat.start()
-            await asyncio.gather(
-                agent.run(),
-                channels.start_all(),
-            )
+            if idle_monitor:
+                await idle_monitor.start()
+            agent_task = asyncio.create_task(agent.run())
+            channels_task = asyncio.create_task(channels.start_all())
+            # Let channels authenticate before sending opening messages.
+            await asyncio.sleep(5)
+            if idle_monitor:
+                await _send_opening_messages()
+            await asyncio.gather(agent_task, channels_task)
         except KeyboardInterrupt:
             console.print("\nShutting down...")
         finally:
             await agent.close_mcp()
+            if idle_monitor:
+                idle_monitor.stop()
             heartbeat.stop()
             cron.stop()
             agent.stop()
@@ -899,6 +1039,50 @@ def status(
                 console.print(
                     f"{spec.label}: {'[green]✓[/green]' if has_key else '[dim]not set[/dim]'}"
                 )
+
+
+# ============================================================================
+# Cron Commands
+# ============================================================================
+
+cron_app = typer.Typer(help="Manage cron jobs")
+app.add_typer(cron_app, name="cron")
+
+
+@cron_app.command("add")
+def cron_add(
+    name: str = typer.Option(..., "--name", help="Job name"),
+    message: str = typer.Option(..., "--message", help="Message for the agent"),
+    cron_expr: str = typer.Option(..., "--cron", help="Cron expression (e.g. '0 9 * * *')"),
+    tz: str = typer.Option(None, "--tz", help="Timezone (e.g. 'America/New_York')"),
+    config: Path | None = typer.Option(
+        None,
+        "--config",
+        "-c",
+        help="Path to config file",
+        exists=True,
+        dir_okay=False,
+        resolve_path=True,
+    ),
+):
+    """Add a new cron job."""
+    from nanobot.config.loader import get_data_dir
+    from nanobot.cron.service import CronService
+    from nanobot.cron.types import CronSchedule
+
+    schedule = CronSchedule(kind="cron", expr=cron_expr, tz=tz)
+
+    data_dir = get_data_dir()
+    store_path = data_dir / "cron" / "jobs.json"
+    svc = CronService(store_path)
+
+    try:
+        job = svc.add_job(name=name, schedule=schedule, message=message)
+    except ValueError as exc:
+        console.print(f"Error: {exc}")
+        raise typer.Exit(code=1)
+
+    console.print(f"[green]✓[/green] Job '{job.name}' added ({job.id})")
 
 
 # ============================================================================
