@@ -28,7 +28,11 @@ IDLE_NUDGE_PROMPT = (
 )
 IDLE_NEW_TOPIC_PROMPT = (
     "[Idle Monitor] Discussion has stalled. "
-    "Propose a new question or switch to a sub-topic to restart the conversation."
+    "Propose a new question or switch to a sub-topic to restart the conversation. "
+    "IMPORTANT: Review the conversation history and your memory. "
+    "Do NOT repeat a topic that has already been discussed. "
+    "Choose a fresh angle, a different domain, or a follow-up question "
+    "that builds on previous conclusions."
 )
 
 OPENING_PROMPT = (
@@ -36,7 +40,10 @@ OPENING_PROMPT = (
     "Introduce yourself briefly according to your role identity, "
     "then propose an opening discussion topic following your Topic Selection Principles. "
     "The topic should require distributed cognition, external research, "
-    "and multi-round iteration."
+    "and multi-round iteration. "
+    "IMPORTANT: Check your memory and conversation history first. "
+    "If previous discussions have occurred, do NOT propose the same topic again. "
+    "Pick a completely new topic that has not been covered before."
 )
 
 

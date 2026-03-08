@@ -483,7 +483,7 @@ class TestBuildOpeningPrompt:
         assert result.startswith(OPENING_PROMPT)
 
     def test_fallback_for_none_equivalent(self):
-        # Empty list is the fallback case
+        # Empty list is the fallback case — no @mention instructions appended
         result = build_opening_prompt([])
         assert result == OPENING_PROMPT
-        assert "IMPORTANT" not in result
+        assert "@" not in result
